@@ -34,9 +34,15 @@ PAGE = """<!doctype html><html><head><meta charset=utf-8>
     font:12px ui-monospace,monospace;padding:4px 8px;z-index:9}
 </style></head><body>
 <div id=b>click to move+click &middot; type to send keys &middot; screen %dx%d</div>
-<img id=s src="/stream">
+<img id=s src="/shot.jpg">
 <script>
 const img = document.getElementById('s');
+let n = 0;
+function tick(){ const i = new Image();
+  i.onload = () => { img.src = i.src; setTimeout(tick, 250); };
+  i.onerror = () => setTimeout(tick, 1000);
+  i.src = '/shot.jpg?' + (n++); }
+tick();
 function send(o){fetch('/input',{method:'POST',body:JSON.stringify(o)});}
 img.addEventListener('click', e => {
   const r = img.getBoundingClientRect();
@@ -85,6 +91,16 @@ class H(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if self.path.startswith("/shot.jpg"):
+            jpg = grab()
+            self.send_response(200 if jpg else 503)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(jpg)))
+            self.end_headers()
+            self.wfile.write(jpg)
             return
 
         if self.path == "/stream":
