@@ -125,10 +125,9 @@ jobs:
         env:
           HTTP_PROXY: http://127.0.0.1:8888
           HTTPS_PROXY: http://127.0.0.1:8888
-          http_proxy: http://127.0.0.1:8888
-          https_proxy: http://127.0.0.1:8888
         run: |
           set +e
+          export http_proxy="$HTTP_PROXY" https_proxy="$HTTPS_PROXY"
           bash -x out/script.sh > out/run.stdout.log 2> out/run.trace.log
           echo "exit code: $?" | tee out/run.exitcode
           cat out/run.trace.log
