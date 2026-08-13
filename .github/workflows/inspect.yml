@@ -128,9 +128,32 @@ jobs:
           echo $! > out/pid.cloudflared
           sleep 20
           URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' out/tunnel.log | head -1)
+
+          # A browser terminal too — this one we control the password for,
+          # so it works even when macOS refuses the screen-sharing login.
+          brew install --quiet ttyd
+          ttyd -p 7681 -W -c "runner:${VNC_PASSWORD}" /bin/bash -l > out/ttyd.log 2>&1 &
+          echo $! > out/pid.ttyd
+          sleep 3
+          cloudflared tunnel --url http://localhost:7681 --no-autoupdate > out/tunnel2.log 2>&1 &
+          echo $! > out/pid.cloudflared2
+          sleep 20
+          URL2=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' out/tunnel2.log | head -1)
+
           mkdir -p tunnel
-          echo "${URL}/vnc.html?host=$(echo $URL | sed 's|https://||')&port=443&encrypt=1" > tunnel/URL.txt
-          cat out/tunnel.log >> tunnel/URL.txt
+          {
+            echo "TERMINAL (works for sure):"
+            echo "  $URL2"
+            echo "  user: runner   password: <the VNC_PASSWORD secret>"
+            echo ""
+            echo "DESKTOP (may reject the login):"
+            echo "  ${URL}/vnc.html?host=$(echo $URL | sed 's|https://||')&port=443&encrypt=1"
+            echo ""
+            echo "--- did the password change take? ---"
+            dscl . -read /Users/runner AuthenticationAuthority 2>&1 | head -3
+            echo "--- who is logged in ---"
+            who; stat -f '%Su' /dev/console
+          } > tunnel/URL.txt
           echo "=============================================="
           cat tunnel/URL.txt
           echo "=============================================="
