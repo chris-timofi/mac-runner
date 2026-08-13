@@ -1,0 +1,74 @@
+name: Inspect a curl script
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "URL of the script to fetch"
+        required: true
+      run_it:
+        description: "Actually execute it? (false = just download and read it)"
+        type: boolean
+        default: false
+
+jobs:
+  inspect:
+    runs-on: macos-14   # Apple Silicon (M1), free on public repos
+    timeout-minutes: 30
+
+    steps:
+      - name: Machine facts
+        run: |
+          uname -a
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+
+      - name: Fetch the script (do not run)
+        run: |
+          mkdir -p out
+          curl -fsSL --max-time 60 -D out/headers.txt "${{ inputs.url }}" -o out/script.sh
+          echo "--- size / hash ---"
+          wc -c out/script.sh
+          shasum -a 256 out/script.sh
+
+      - name: Read it
+        run: cat out/script.sh
+
+      - name: What it touches (grep for the usual suspects)
+        run: |
+          grep -nE 'curl|wget|sudo|launchctl|LaunchAgents|LaunchDaemons|/etc/|~/\.|chmod \+x|osascript|defaults write|security |keychain|nc |base64|eval|ssh' out/script.sh || echo "nothing matched"
+
+      - name: Snapshot BEFORE
+        if: inputs.run_it
+        run: |
+          ls -laR "$HOME" > out/home.before.txt 2>/dev/null || true
+          ls -la /Applications /usr/local/bin /opt/homebrew/bin > out/bins.before.txt 2>/dev/null || true
+          launchctl list > out/launchd.before.txt 2>/dev/null || true
+          ps -Ao pid,comm > out/ps.before.txt
+
+      - name: RUN IT
+        if: inputs.run_it
+        run: bash out/script.sh 2>&1 | tee out/run.log
+
+      - name: Snapshot AFTER + diff
+        if: inputs.run_it
+        run: |
+          ls -laR "$HOME" > out/home.after.txt 2>/dev/null || true
+          ls -la /Applications /usr/local/bin /opt/homebrew/bin > out/bins.after.txt 2>/dev/null || true
+          launchctl list > out/launchd.after.txt 2>/dev/null || true
+          ps -Ao pid,comm > out/ps.after.txt
+          echo "=== NEW/CHANGED FILES IN HOME ==="
+          diff out/home.before.txt out/home.after.txt || true
+          echo "=== NEW BINARIES ==="
+          diff out/bins.before.txt out/bins.after.txt || true
+          echo "=== NEW BACKGROUND SERVICES ==="
+          diff out/launchd.before.txt out/launchd.after.txt || true
+          echo "=== NEW PROCESSES ==="
+          diff out/ps.before.txt out/ps.after.txt || true
+
+      - name: Keep everything
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inspection
+          path: out/
