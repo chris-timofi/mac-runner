@@ -10,11 +10,18 @@ on:
         description: "Actually execute it? (false = just download and read it)"
         type: boolean
         default: false
+      desktop:
+        description: "Open a full macOS desktop I can VNC into"
+        type: boolean
+        default: false
+      hold_minutes:
+        description: "How long to hold the desktop open"
+        default: "60"
 
 jobs:
   inspect:
     runs-on: macos-14   # Apple Silicon (M1), free on public repos
-    timeout-minutes: 45
+    timeout-minutes: 360
 
     steps:
       - name: Machine facts
@@ -38,24 +45,21 @@ jobs:
           grep -nE 'curl|wget|sudo|launchctl|LaunchAgents|LaunchDaemons|/etc/|~/\.|chmod \+x|osascript|defaults write|security |keychain|nc |base64|eval|ssh' \
             out/script.sh | tee out/suspects.txt || echo "nothing matched"
 
-      # ---------- watchers: start BEFORE the script runs ----------
+      # ---------- watchers: start BEFORE anything runs ----------
 
       - name: Install the HTTPS interceptor
-        if: inputs.run_it
+        if: inputs.run_it || inputs.desktop
         run: brew install --quiet mitmproxy
 
       - name: Start all recorders
-        if: inputs.run_it
+        if: inputs.run_it || inputs.desktop
         run: |
-          # 1. every file opened, written, deleted — live
           sudo fs_usage -w -f filesys > out/files.live.log 2>/dev/null &
           echo $! > out/pid.fsusage
 
-          # 2. every packet: gives domains + IPs even if the proxy is bypassed
           sudo tcpdump -i any -n -s 0 -w out/traffic.pcap > /dev/null 2>&1 &
           echo $! > out/pid.tcpdump
 
-          # 3. full HTTPS bodies: every URL fetched and every file downloaded
           mitmdump --quiet --set confdir="$HOME/.mitmproxy" \
                    -w out/https.flows --listen-port 8888 > out/mitm.log 2>&1 &
           echo $! > out/pid.mitm
@@ -63,25 +67,57 @@ jobs:
           sudo security add-trusted-cert -d -r trustRoot \
             -k /Library/Keychains/System.keychain "$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 
-          # 4. every process that appears, twice a second
           ( while :; do date +%s.%N; ps -Ao pid,ppid,user,command; sleep 0.5; done ) \
             > out/processes.live.log 2>&1 &
           echo $! > out/pid.ps
 
+          # macOS's own system log — what Wazuh reads
+          sudo log stream --style compact --level info \
+            --predicate 'eventMessage CONTAINS[c] "exec" OR subsystem CONTAINS "com.apple.xpc" OR subsystem CONTAINS "securityd" OR subsystem CONTAINS "network"' \
+            > out/system.log 2>&1 &
+          echo $! > out/pid.log
+
           sleep 2
 
-      - name: Snapshot BEFORE
-        if: inputs.run_it
-        run: |
-          ls -laR "$HOME" > out/home.before.txt 2>/dev/null || true
-          ls -la /Applications /usr/local/bin /opt/homebrew/bin > out/bins.before.txt 2>/dev/null || true
-          launchctl list > out/launchd.before.txt 2>/dev/null || true
-          crontab -l > out/cron.before.txt 2>/dev/null || true
+      - name: Snapshot BEFORE (incl. every hiding spot)
+        if: inputs.run_it || inputs.desktop
+        run: bash scripts/snapshot.sh before
 
-      # ---------- the actual run, fully traced ----------
+      # ---------- full desktop over VNC ----------
+
+      - name: Open the desktop and tunnel it out
+        if: inputs.desktop
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          if [ -z "$VNC_PASSWORD" ]; then echo "::error::repo secret VNC_PASSWORD is not set"; exit 1; fi
+          sudo dscl . -passwd /Users/runner "$VNC_PASSWORD" || true
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -activate -configure -access -on \
+            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASSWORD" \
+            -restart -agent -privs -all
+          brew install --quiet cloudflared
+          cloudflared tunnel --url tcp://localhost:5900 --no-autoupdate > out/tunnel.log 2>&1 &
+          sleep 15
+          echo "=============================================="
+          grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' out/tunnel.log | head -1
+          echo "=============================================="
+          echo "On your Mac:"
+          echo "  brew install cloudflared"
+          echo "  cloudflared access tcp --hostname <the URL above> --url localhost:5901"
+          echo "  then open Screen Sharing and connect to  localhost:5901"
+          echo "  user: runner   password: the VNC_PASSWORD secret"
+
+      - name: Hold the desktop open
+        if: inputs.desktop
+        run: |
+          echo "Holding for ${{ inputs.hold_minutes }} minutes. Cancel the job when you're done."
+          sleep $(( ${{ inputs.hold_minutes }} * 60 ))
+
+      # ---------- or just run it, fully traced ----------
 
       - name: RUN IT (every command line logged)
-        if: inputs.run_it
+        if: inputs.run_it && !inputs.desktop
         env:
           HTTP_PROXY: http://127.0.0.1:8888
           HTTPS_PROXY: http://127.0.0.1:8888
@@ -89,7 +125,6 @@ jobs:
           https_proxy: http://127.0.0.1:8888
         run: |
           set +e
-          # -x prints every command the script executes, expanded
           bash -x out/script.sh > out/run.stdout.log 2> out/run.trace.log
           echo "exit code: $?" | tee out/run.exitcode
           cat out/run.trace.log
@@ -97,35 +132,13 @@ jobs:
       # ---------- stop, diff, package ----------
 
       - name: Stop recorders and diff the machine
-        if: always() && inputs.run_it
+        if: always() && (inputs.run_it || inputs.desktop)
         run: |
           sleep 3
+          bash scripts/snapshot.sh after
           for p in out/pid.*; do sudo kill "$(cat $p)" 2>/dev/null || true; done
           sleep 2
-
-          ls -laR "$HOME" > out/home.after.txt 2>/dev/null || true
-          ls -la /Applications /usr/local/bin /opt/homebrew/bin > out/bins.after.txt 2>/dev/null || true
-          launchctl list > out/launchd.after.txt 2>/dev/null || true
-          crontab -l > out/cron.after.txt 2>/dev/null || true
-
-          echo "=== NEW / CHANGED FILES IN HOME ===" | tee out/CHANGES.txt
-          diff out/home.before.txt out/home.after.txt >> out/CHANGES.txt 2>&1 || true
-          echo "=== NEW BINARIES ===" >> out/CHANGES.txt
-          diff out/bins.before.txt out/bins.after.txt >> out/CHANGES.txt 2>&1 || true
-          echo "=== NEW BACKGROUND SERVICES ===" >> out/CHANGES.txt
-          diff out/launchd.before.txt out/launchd.after.txt >> out/CHANGES.txt 2>&1 || true
-          echo "=== NEW SCHEDULED JOBS ===" >> out/CHANGES.txt
-          diff out/cron.before.txt out/cron.after.txt >> out/CHANGES.txt 2>&1 || true
-          cat out/CHANGES.txt
-
-          echo "=== EVERY DOMAIN AND IP CONTACTED ===" | tee out/NETWORK.txt
-          sudo tcpdump -r out/traffic.pcap -n 2>/dev/null \
-            | awk '{print $3, $5}' | sort -u >> out/NETWORK.txt || true
-          mitmdump --quiet -nr out/https.flows 2>/dev/null | tee -a out/NETWORK.txt || true
-          cat out/NETWORK.txt
-
-          echo "=== EVERY PROGRAM IT LAUNCHED ===" | tee out/PROCESSES.txt
-          sort -u out/processes.live.log | grep -vE 'ps -Ao|/bin/sleep' >> out/PROCESSES.txt || true
+          bash scripts/report.sh
 
       - name: Keep everything
         if: always()
