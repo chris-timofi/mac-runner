@@ -14,29 +14,61 @@ on:
 jobs:
   inspect:
     runs-on: macos-14   # Apple Silicon (M1), free on public repos
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Machine facts
         run: |
-          uname -a
-          sysctl -n machdep.cpu.brand_string
-          sw_vers
+          mkdir -p out
+          { uname -a; sysctl -n machdep.cpu.brand_string; sw_vers; } | tee out/machine.txt
+
+      # ---------- static pass: never executes anything ----------
 
       - name: Fetch the script (do not run)
         run: |
-          mkdir -p out
           curl -fsSL --max-time 60 -D out/headers.txt "${{ inputs.url }}" -o out/script.sh
-          echo "--- size / hash ---"
           wc -c out/script.sh
-          shasum -a 256 out/script.sh
+          shasum -a 256 out/script.sh | tee out/script.sha256
 
       - name: Read it
         run: cat out/script.sh
 
       - name: What it touches (grep for the usual suspects)
         run: |
-          grep -nE 'curl|wget|sudo|launchctl|LaunchAgents|LaunchDaemons|/etc/|~/\.|chmod \+x|osascript|defaults write|security |keychain|nc |base64|eval|ssh' out/script.sh || echo "nothing matched"
+          grep -nE 'curl|wget|sudo|launchctl|LaunchAgents|LaunchDaemons|/etc/|~/\.|chmod \+x|osascript|defaults write|security |keychain|nc |base64|eval|ssh' \
+            out/script.sh | tee out/suspects.txt || echo "nothing matched"
+
+      # ---------- watchers: start BEFORE the script runs ----------
+
+      - name: Install the HTTPS interceptor
+        if: inputs.run_it
+        run: brew install --quiet mitmproxy
+
+      - name: Start all recorders
+        if: inputs.run_it
+        run: |
+          # 1. every file opened, written, deleted — live
+          sudo fs_usage -w -f filesys > out/files.live.log 2>/dev/null &
+          echo $! > out/pid.fsusage
+
+          # 2. every packet: gives domains + IPs even if the proxy is bypassed
+          sudo tcpdump -i any -n -s 0 -w out/traffic.pcap > /dev/null 2>&1 &
+          echo $! > out/pid.tcpdump
+
+          # 3. full HTTPS bodies: every URL fetched and every file downloaded
+          mitmdump --quiet --set confdir="$HOME/.mitmproxy" \
+                   -w out/https.flows --listen-port 8888 > out/mitm.log 2>&1 &
+          echo $! > out/pid.mitm
+          sleep 8
+          sudo security add-trusted-cert -d -r trustRoot \
+            -k /Library/Keychains/System.keychain "$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+
+          # 4. every process that appears, twice a second
+          ( while :; do date +%s.%N; ps -Ao pid,ppid,user,command; sleep 0.5; done ) \
+            > out/processes.live.log 2>&1 &
+          echo $! > out/pid.ps
+
+          sleep 2
 
       - name: Snapshot BEFORE
         if: inputs.run_it
@@ -44,27 +76,56 @@ jobs:
           ls -laR "$HOME" > out/home.before.txt 2>/dev/null || true
           ls -la /Applications /usr/local/bin /opt/homebrew/bin > out/bins.before.txt 2>/dev/null || true
           launchctl list > out/launchd.before.txt 2>/dev/null || true
-          ps -Ao pid,comm > out/ps.before.txt
+          crontab -l > out/cron.before.txt 2>/dev/null || true
 
-      - name: RUN IT
-        if: inputs.run_it
-        run: bash out/script.sh 2>&1 | tee out/run.log
+      # ---------- the actual run, fully traced ----------
 
-      - name: Snapshot AFTER + diff
+      - name: RUN IT (every command line logged)
         if: inputs.run_it
+        env:
+          HTTP_PROXY: http://127.0.0.1:8888
+          HTTPS_PROXY: http://127.0.0.1:8888
+          http_proxy: http://127.0.0.1:8888
+          https_proxy: http://127.0.0.1:8888
         run: |
+          set +e
+          # -x prints every command the script executes, expanded
+          bash -x out/script.sh > out/run.stdout.log 2> out/run.trace.log
+          echo "exit code: $?" | tee out/run.exitcode
+          cat out/run.trace.log
+
+      # ---------- stop, diff, package ----------
+
+      - name: Stop recorders and diff the machine
+        if: always() && inputs.run_it
+        run: |
+          sleep 3
+          for p in out/pid.*; do sudo kill "$(cat $p)" 2>/dev/null || true; done
+          sleep 2
+
           ls -laR "$HOME" > out/home.after.txt 2>/dev/null || true
           ls -la /Applications /usr/local/bin /opt/homebrew/bin > out/bins.after.txt 2>/dev/null || true
           launchctl list > out/launchd.after.txt 2>/dev/null || true
-          ps -Ao pid,comm > out/ps.after.txt
-          echo "=== NEW/CHANGED FILES IN HOME ==="
-          diff out/home.before.txt out/home.after.txt || true
-          echo "=== NEW BINARIES ==="
-          diff out/bins.before.txt out/bins.after.txt || true
-          echo "=== NEW BACKGROUND SERVICES ==="
-          diff out/launchd.before.txt out/launchd.after.txt || true
-          echo "=== NEW PROCESSES ==="
-          diff out/ps.before.txt out/ps.after.txt || true
+          crontab -l > out/cron.after.txt 2>/dev/null || true
+
+          echo "=== NEW / CHANGED FILES IN HOME ===" | tee out/CHANGES.txt
+          diff out/home.before.txt out/home.after.txt >> out/CHANGES.txt 2>&1 || true
+          echo "=== NEW BINARIES ===" >> out/CHANGES.txt
+          diff out/bins.before.txt out/bins.after.txt >> out/CHANGES.txt 2>&1 || true
+          echo "=== NEW BACKGROUND SERVICES ===" >> out/CHANGES.txt
+          diff out/launchd.before.txt out/launchd.after.txt >> out/CHANGES.txt 2>&1 || true
+          echo "=== NEW SCHEDULED JOBS ===" >> out/CHANGES.txt
+          diff out/cron.before.txt out/cron.after.txt >> out/CHANGES.txt 2>&1 || true
+          cat out/CHANGES.txt
+
+          echo "=== EVERY DOMAIN AND IP CONTACTED ===" | tee out/NETWORK.txt
+          sudo tcpdump -r out/traffic.pcap -n 2>/dev/null \
+            | awk '{print $3, $5}' | sort -u >> out/NETWORK.txt || true
+          mitmdump --quiet -nr out/https.flows 2>/dev/null | tee -a out/NETWORK.txt || true
+          cat out/NETWORK.txt
+
+          echo "=== EVERY PROGRAM IT LAUNCHED ===" | tee out/PROCESSES.txt
+          sort -u out/processes.live.log | grep -vE 'ps -Ao|/bin/sleep' >> out/PROCESSES.txt || true
 
       - name: Keep everything
         if: always()
