@@ -97,6 +97,8 @@ jobs:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           if [ -z "$VNC_PASSWORD" ]; then echo "::error::repo secret VNC_PASSWORD is not set"; exit 1; fi
+          # the runner reaps background processes at step end unless this is cleared
+          export RUNNER_TRACKING_ID=""
           # Changing the runner account's password needs the old one, which we
           # don't have. Creating a BRAND NEW admin user doesn't. macOS gives a
           # non-console user their own virtual desktop over screen sharing.
@@ -129,10 +131,10 @@ jobs:
             python3 -m pip install --quiet websockify
           git clone --depth 1 -q https://github.com/novnc/noVNC.git "$HOME/noVNC"
           NOVNC_WEB="$HOME/noVNC"
-          python3 -m websockify --web "$NOVNC_WEB" 6080 localhost:5900 > out/websockify.log 2>&1 &
+          nohup python3 -m websockify --web "$NOVNC_WEB" 6080 localhost:5900 </dev/null > out/websockify.log 2>&1 &
           echo $! > out/pid.websockify
           sleep 5
-          cloudflared tunnel --url http://localhost:6080 --no-autoupdate > out/tunnel.log 2>&1 &
+          nohup cloudflared tunnel --url http://localhost:6080 --no-autoupdate </dev/null > out/tunnel.log 2>&1 &
           echo $! > out/pid.cloudflared
           sleep 20
           URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' out/tunnel.log | head -1)
@@ -140,10 +142,10 @@ jobs:
           # A browser terminal too — this one we control the password for,
           # so it works even when macOS refuses the screen-sharing login.
           brew install --quiet ttyd
-          ttyd -p 7681 -W -c "runner:${VNC_PASSWORD}" /bin/bash -l > out/ttyd.log 2>&1 &
+          nohup ttyd -p 7681 -W -c "runner:${VNC_PASSWORD}" /bin/bash -l </dev/null > out/ttyd.log 2>&1 &
           echo $! > out/pid.ttyd
           sleep 3
-          cloudflared tunnel --url http://localhost:7681 --no-autoupdate > out/tunnel2.log 2>&1 &
+          nohup cloudflared tunnel --url http://localhost:7681 --no-autoupdate </dev/null > out/tunnel2.log 2>&1 &
           echo $! > out/pid.cloudflared2
           sleep 20
           URL2=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' out/tunnel2.log | head -1)
