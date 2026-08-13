@@ -102,17 +102,30 @@ jobs:
             -activate -configure -access -on \
             -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASSWORD" \
             -restart -agent -privs -all
-          brew install --quiet cloudflared
-          cloudflared tunnel --url tcp://localhost:5900 --no-autoupdate > out/tunnel.log 2>&1 &
-          sleep 15
+          # noVNC turns the Mac's screen into a plain web page, so a
+          # Cloudflare quick tunnel (HTTP only) can carry it to a browser.
+          brew install --quiet cloudflared novnc websockify
+          NOVNC_WEB=$(brew --prefix novnc)/share/novnc
+          websockify --web "$NOVNC_WEB" 6080 localhost:5900 > out/websockify.log 2>&1 &
+          echo $! > out/pid.websockify
+          sleep 5
+          cloudflared tunnel --url http://localhost:6080 --no-autoupdate > out/tunnel.log 2>&1 &
+          echo $! > out/pid.cloudflared
+          sleep 20
+          URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' out/tunnel.log | head -1)
+          mkdir -p tunnel
+          echo "${URL}/vnc.html?host=$(echo $URL | sed 's|https://||')&port=443&encrypt=1" > tunnel/URL.txt
+          cat out/tunnel.log >> tunnel/URL.txt
           echo "=============================================="
-          grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' out/tunnel.log | head -1
+          cat tunnel/URL.txt
           echo "=============================================="
-          echo "On your Mac:"
-          echo "  brew install cloudflared"
-          echo "  cloudflared access tcp --hostname <the URL above> --url localhost:5901"
-          echo "  then open Screen Sharing and connect to  localhost:5901"
-          echo "  user: runner   password: the VNC_PASSWORD secret"
+
+      - name: Publish the address so it is readable while the job runs
+        if: inputs.desktop
+        uses: actions/upload-artifact@v4
+        with:
+          name: tunnel
+          path: tunnel/
 
       - name: Hold the desktop open
         if: inputs.desktop
