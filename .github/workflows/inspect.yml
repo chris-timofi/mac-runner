@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       url:
-        description: "URL of the script to fetch"
-        required: true
+        description: "URL of a script to fetch (optional - leave blank for a bare desktop)"
+        required: false
+        default: ""
       run_it:
         description: "Actually execute it? (false = just download and read it)"
         type: boolean
@@ -32,15 +33,18 @@ jobs:
       # ---------- static pass: never executes anything ----------
 
       - name: Fetch the script (do not run)
+        if: inputs.url != ''
         run: |
           curl -fsSL --max-time 60 -D out/headers.txt "${{ inputs.url }}" -o out/script.sh
           wc -c out/script.sh
           shasum -a 256 out/script.sh | tee out/script.sha256
 
       - name: Read it
+        if: inputs.url != ''
         run: cat out/script.sh
 
       - name: What it touches (grep for the usual suspects)
+        if: inputs.url != ''
         run: |
           grep -nE 'curl|wget|sudo|launchctl|LaunchAgents|LaunchDaemons|/etc/|~/\.|chmod \+x|osascript|defaults write|security |keychain|nc |base64|eval|ssh' \
             out/script.sh | tee out/suspects.txt || echo "nothing matched"
