@@ -97,16 +97,31 @@ jobs:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           if [ -z "$VNC_PASSWORD" ]; then echo "::error::repo secret VNC_PASSWORD is not set"; exit 1; fi
-          sudo dscl . -passwd /Users/runner "$VNC_PASSWORD" || true
+          # sysadminctl resets the password without needing the old one
+          sudo sysadminctl -resetPasswordFor runner -newPassword "$VNC_PASSWORD" 2>&1 || true
+
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
             -activate -configure -access -on \
             -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASSWORD" \
             -restart -agent -privs -all
+          # give ARDAgent permission to record the screen, or VNC shows black
+          sudo sqlite3 /Library/Application\ Support/com.apple.TCC/TCC.db \
+            "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','com.apple.RemoteDesktop.agent',0,2,4,1,NULL,NULL,NULL,'UNUSED',NULL,0,1687335058,NULL,NULL,'UNUSED',0);" 2>&1 || true
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 || true
+          sudo launchctl enable system/com.apple.screensharing 2>&1 || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>&1 || true
+          sleep 5
+          echo "--- is anything listening on 5900? ---"
+          netstat -an | grep 5900 || echo "NOTHING ON 5900"
+
           # noVNC turns the Mac's screen into a plain web page, so a
           # Cloudflare quick tunnel (HTTP only) can carry it to a browser.
-          brew install --quiet cloudflared novnc websockify
-          NOVNC_WEB=$(brew --prefix novnc)/share/novnc
-          websockify --web "$NOVNC_WEB" 6080 localhost:5900 > out/websockify.log 2>&1 &
+          brew install --quiet cloudflared
+          python3 -m pip install --break-system-packages --quiet websockify 2>&1 | tail -2 || \
+            python3 -m pip install --quiet websockify
+          git clone --depth 1 -q https://github.com/novnc/noVNC.git "$HOME/noVNC"
+          NOVNC_WEB="$HOME/noVNC"
+          python3 -m websockify --web "$NOVNC_WEB" 6080 localhost:5900 > out/websockify.log 2>&1 &
           echo $! > out/pid.websockify
           sleep 5
           cloudflared tunnel --url http://localhost:6080 --no-autoupdate > out/tunnel.log 2>&1 &
