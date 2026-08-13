@@ -161,6 +161,14 @@ jobs:
             echo ""
             echo "  log in as user 'vnc' with the same password"
             echo ""
+            echo "--- IS ANYTHING LISTENING ON 5900? ---"
+            netstat -an | grep -E '\.5900|\.6080|\.7681' || echo "NOTHING LISTENING"
+            echo "--- screen sharing daemon ---"
+            sudo launchctl print system/com.apple.screensharing 2>&1 | head -12
+            echo "--- websockify log ---"
+            tail -20 out/websockify.log 2>&1
+            echo "--- ttyd log ---"
+            tail -20 out/ttyd.log 2>&1
             echo "--- does the vnc user authenticate? ---"
             dscl . -authonly vnc "$VNC_PASSWORD" && echo "AUTH OK" || echo "AUTH FAILED"
             dscl . -list /Users | grep -E '^(vnc|runner)$'
