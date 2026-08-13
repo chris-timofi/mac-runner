@@ -97,13 +97,21 @@ jobs:
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
         run: |
           if [ -z "$VNC_PASSWORD" ]; then echo "::error::repo secret VNC_PASSWORD is not set"; exit 1; fi
-          # sysadminctl resets the password without needing the old one
-          sudo sysadminctl -resetPasswordFor runner -newPassword "$VNC_PASSWORD" 2>&1 || true
+          # Changing the runner account's password needs the old one, which we
+          # don't have. Creating a BRAND NEW admin user doesn't. macOS gives a
+          # non-console user their own virtual desktop over screen sharing.
+          sudo sysadminctl -addUser vnc -fullName "VNC" -password "$VNC_PASSWORD" -admin 2>&1 || true
+          sudo dscl . -append /Groups/admin GroupMembership vnc 2>&1 || true
+          sudo dscl . -append /Groups/com.apple.access_ssh GroupMembership vnc 2>&1 || true
+          echo "--- can the new user actually authenticate? ---"
+          dscl . -authonly vnc "$VNC_PASSWORD" && echo "AUTH OK" || echo "AUTH FAILED"
 
           sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on \
+            -activate -configure -allowAccessFor -allUsers -privs -all \
             -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw "$VNC_PASSWORD" \
-            -restart -agent -privs -all
+            -restart -agent
+          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
+            -configure -users vnc,runner -access -on -privs -all 2>&1 || true
           # give ARDAgent permission to record the screen, or VNC shows black
           sudo sqlite3 /Library/Application\ Support/com.apple.TCC/TCC.db \
             "INSERT OR REPLACE INTO access VALUES('kTCCServiceScreenCapture','com.apple.RemoteDesktop.agent',0,2,4,1,NULL,NULL,NULL,'UNUSED',NULL,0,1687335058,NULL,NULL,'UNUSED',0);" 2>&1 || true
@@ -149,8 +157,11 @@ jobs:
             echo "DESKTOP (may reject the login):"
             echo "  ${URL}/vnc.html?host=$(echo $URL | sed 's|https://||')&port=443&encrypt=1"
             echo ""
-            echo "--- did the password change take? ---"
-            dscl . -read /Users/runner AuthenticationAuthority 2>&1 | head -3
+            echo "  log in as user 'vnc' with the same password"
+            echo ""
+            echo "--- does the vnc user authenticate? ---"
+            dscl . -authonly vnc "$VNC_PASSWORD" && echo "AUTH OK" || echo "AUTH FAILED"
+            dscl . -list /Users | grep -E '^(vnc|runner)$'
             echo "--- who is logged in ---"
             who; stat -f '%Su' /dev/console
           } > tunnel/URL.txt
